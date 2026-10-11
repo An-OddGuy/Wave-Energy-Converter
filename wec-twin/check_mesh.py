@@ -20,10 +20,12 @@ from pathlib import Path
 import trimesh
 import yaml
 
+HERE = Path(__file__).resolve().parent   # so the script works from any working directory
+
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dir", default="cad_out")
+    ap.add_argument("--dir", default=str(HERE / "cad_out"))
     ap.add_argument("--tol", type=float, default=0.02,
                     help="allowed relative volume error vs CAD (default 2%%)")
     args = ap.parse_args()

@@ -27,10 +27,9 @@ mat:                      # submerged, height-adjustable wave-shaping plate
   depth: 0.15             # m, depth of the mat's TOP surface below SWL (the control variable)
   depth_min: 0.05         # m, actuator range, used by later stages
   depth_max: 0.40         # m
-  thickness: 0.01         # m
-  # ring shape
-  ring_inner_radius: 0.20 # m
-  ring_outer_radius: 0.45 # m
+  thickness: 0.03
+  ring_inner_radius: 0.20
+  ring_outer_radius: 1.00
   # plate shape
   plate_length: 0.40      # m, along wave direction (x)
   plate_width: 0.60       # m, across wave direction (y)

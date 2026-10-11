@@ -23,6 +23,8 @@ from pathlib import Path
 import yaml
 import cadquery as cq
 
+HERE = Path(__file__).resolve().parent   # so the script works from any working directory
+
 
 # ----------------------------------------------------------------- primitives
 def cylinder(radius, height, z0):
@@ -87,7 +89,7 @@ def validate(p):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--params", default="params.yaml")
+    ap.add_argument("--params", default=str(HERE / "params.yaml"))
     ap.add_argument("--mat-depth", type=float, default=None,
                     help="override mat.depth (m)")
     ap.add_argument("--out", default=None, help="override export.out_dir")
@@ -101,7 +103,7 @@ def main():
 
     env, b, sh, ba, m, ex = (p["environment"], p["buoy"], p["shaft"],
                              p["base"], p["mat"], p["export"])
-    out = Path(args.out or ex["out_dir"])
+    out = Path(args.out) if args.out else HERE / ex["out_dir"]
     out.mkdir(parents=True, exist_ok=True)
 
     # ---- parts (world frame, z = 0 at SWL)
