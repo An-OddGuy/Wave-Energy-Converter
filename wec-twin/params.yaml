@@ -1,0 +1,42 @@
+# params.yaml - single source of truth for the WEC digital twin
+# Units: metres, kilograms, seconds. Frame: z up, z = 0 at still water level (SWL).
+# Model-scale point absorber (roughly 1:25). Change values freely and re-run make_cad.py.
+
+environment:
+  water_depth: 1.0        # m, SWL to seabed
+  rho_water: 1000.0       # kg/m^3 (fresh water; use 1025 for sea water)
+  gravity: 9.81
+
+buoy:
+  radius: 0.12            # m
+  height: 0.20            # m, total cylinder height
+  draft: 0.10             # m, design draft at rest (how deep it floats)
+  mass: null              # kg; null = neutrally buoyant, mass = rho * pi * r^2 * draft
+
+shaft:                    # fixed spar the buoy slides along (reaction structure)
+  radius: 0.015           # m
+  top_above_buoy: 0.10    # m, shaft end above the buoy top at rest
+
+base:                     # seabed foundation plate
+  radius: 0.30            # m
+  thickness: 0.03         # m
+
+mat:                      # submerged, height-adjustable wave-shaping plate
+  enabled: true
+  shape: ring             # ring (axisymmetric, no direction dependence) | plate (directional)
+  depth: 0.15             # m, depth of the mat's TOP surface below SWL (the control variable)
+  depth_min: 0.05         # m, actuator range, used by later stages
+  depth_max: 0.40         # m
+  thickness: 0.01         # m
+  # ring shape
+  ring_inner_radius: 0.20 # m
+  ring_outer_radius: 0.45 # m
+  # plate shape
+  plate_length: 0.40      # m, along wave direction (x)
+  plate_width: 0.60       # m, across wave direction (y)
+  plate_x_offset: -0.50   # m, centre of plate relative to buoy axis (negative = up-wave)
+
+export:
+  out_dir: cad_out
+  linear_tolerance: 0.001   # m, STL tessellation accuracy
+  angular_tolerance: 0.1    # rad

@@ -1,0 +1,45 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Secrets (Wokwi token, API keys)
+.env
+*.token
+
+# Generated CAD (rebuild with make_cad.py; delete this line to commit meshes)
+cad_out/
+
+# Simulation outputs and logs
+results/
+logs/
+*.mat
+*.csv
+*.fmu
+
+# OpenModelica build junk
+*.o
+*_init.xml
+*_info.json
+*_FMU.libs
+*.log
+
+# Compiled controller library
+*.dll
+*.so
+*.dylib
+*.exe
+
+# ESP-IDF / PlatformIO / QEMU
+build/
+sdkconfig.old
+managed_components/
+.pio/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
