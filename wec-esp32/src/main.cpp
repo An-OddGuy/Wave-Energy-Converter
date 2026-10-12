@@ -1,7 +1,8 @@
 // WEC controller firmware (ESP32, Arduino framework / PlatformIO / Wokwi)
 //
 // Serial protocol with wec_realtime.py:
-//   host -> "r\n"                 board -> "ok\n"            reset estimator
+//   host -> "r,<tp>\n"            board -> "ok\n"            reset estimator, start Bpto = pto_lookup(tp)
+//   host -> "r\n"                 board -> "ok\n"            same, but start at B_INIT
 //   host -> "<t>,<z>,<p_mW>\n"    board -> "<bpto>,<tp>\n"   t = plant seconds, z = heave (m)
 //   (p_mW is optional, only used for the OLED)
 //
@@ -14,23 +15,23 @@
 //
 // platformio.ini:
 //   lib_deps = adafruit/Adafruit SSD1306, adafruit/Adafruit GFX Library
-// Put results/pto_table.h in include/ (or src/).
+// Put results/pto_table_wide.h in include/ (or src/).
 
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include "hal.h"
-#include "pto_table.h"      // PTO_TP[], PTO_BPTO[], pto_lookup(tp)
+#include "pto_table_wide.h" // PTO_TP[], PTO_BPTO[], pto_lookup(tp)
 
 // ---------------------------------------------------------------- tuning
-#define B_INIT      7.0f      // damping at start / until a period is known
+#define B_INIT      7.0f      // damping at reset only if the host sends no Tp ("r" without ",<tp>")
 #define B_MIN       3.0f      // LED range
-#define B_MAX       100.0f    // raised from 40: the table goes up to ~95 N s/m
+#define B_MAX       100.0f    // raised from 40: the wide table goes up to ~96 N s/m
 #define HYS         0.0003f   // m, zero-crossing hysteresis, raise if the period jumps around
-#define TZ_TO_TP    1.03f     // heave zero-crossing period -> peak period (refit for the Wide model)
+#define TZ_TO_TP    1.03f     // heave zero-crossing period -> peak period (tz_check.py on the Wide model: ~1.03 for Tp >= 0.9 s)
 #define MEAN_TAU    10.0f     // s, slow mean removal on heave
-#define TP_ALPHA    3.0f      // 1.0 = previous wave only; 0.3..0.6 = light smoothing over recent waves
+#define TP_ALPHA    0.4f      // 1.0 = previous wave only; 0.3..0.6 = light smoothing over recent waves
 #define T_WAVE_MIN  0.30f     // s, reject spurious crossings outside this range
 #define T_WAVE_MAX  3.00f
 
@@ -132,7 +133,7 @@ static bool est_update(float t, float z) {
 }
 
 // ---------------------------------------------------------------- controller
-// Bpto comes straight from the generated table (pto_table.h, Hs = 0.04 m).
+// Bpto comes straight from the generated table (pto_table_wide.h, Hs = 0.04 m).
 // It is held constant and only re-evaluated when a wave finishes.
 static float controller(float tp) {
   if (tp <= 0.0f) return B_INIT;
@@ -145,9 +146,11 @@ static char  line[96];
 static int   n = 0;
 
 static void handle_line(const char* s) {
-  if (s[0] == 'r' && (s[1] == '\0' || s[1] == '\r')) {
+  if (s[0] == 'r' && (s[1] == '\0' || s[1] == '\r' || s[1] == ',')) {
     est_reset();
-    bpto = B_INIT;
+    float tp0 = 0.0f;
+    bool have_tp0 = (s[1] == ',' && sscanf(s + 2, "%f", &tp0) == 1 && tp0 > 0.0f);
+    bpto = have_tp0 ? pto_lookup(tp0) : B_INIT;      // start the sea at its table value
     hal_set_load(bpto);
     hal_show(0.0f, bpto, 0.0f, true);
     Serial.println("ok");
