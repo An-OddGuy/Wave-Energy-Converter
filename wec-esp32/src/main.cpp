@@ -5,27 +5,34 @@
 //   host -> "<t>,<z>,<p_mW>\n"    board -> "<bpto>,<tp>\n"   t = plant seconds, z = heave (m)
 //   (p_mW is optional, only used for the OLED)
 //
+// Control idea: no prediction. Each time a wave finishes (upward zero-crossing of
+// heave), its period gives the latest Tp, pto_lookup() gives Bpto, and that Bpto is
+// held for the next wave.
+//
 // LED  (GPIO25, PWM): brightness follows Bpto
 // OLED (SSD1306, I2C 0x3C on GPIO21/22): Tp, Bpto, power
 //
 // platformio.ini:
 //   lib_deps = adafruit/Adafruit SSD1306, adafruit/Adafruit GFX Library
+// Put results/pto_table.h in include/ (or src/).
 
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include "hal.h"
+#include "pto_table.h"      // PTO_TP[], PTO_BPTO[], pto_lookup(tp)
 
 // ---------------------------------------------------------------- tuning
 #define B_INIT      7.0f      // damping at start / until a period is known
-#define B_MIN       3.0f      // LED range (same as the CoppeliaSim meter)
-#define B_MAX       40.0f
+#define B_MIN       3.0f      // LED range
+#define B_MAX       100.0f    // raised from 40: the table goes up to ~95 N s/m
 #define HYS         0.0003f   // m, zero-crossing hysteresis, raise if the period jumps around
-#define TZ_TO_TP    1.03f     // heave zero-crossing period -> peak period, fitted on the WEC_Heave model
-#define TP_LO      0.70f     // estimate is held inside the range the lookup table covers
-#define TP_HI       1.20f
+#define TZ_TO_TP    1.03f     // heave zero-crossing period -> peak period (refit for the Wide model)
 #define MEAN_TAU    10.0f     // s, slow mean removal on heave
+#define TP_ALPHA    3.0f      // 1.0 = previous wave only; 0.3..0.6 = light smoothing over recent waves
+#define T_WAVE_MIN  0.30f     // s, reject spurious crossings outside this range
+#define T_WAVE_MAX  3.00f
 
 // ---------------------------------------------------------------- HAL: LED + OLED
 static Adafruit_SSD1306 oled(128, 64, &Wire, -1);
@@ -79,66 +86,57 @@ static void hal_show(float tp, float b, float p_mw, bool force = false) {
 // ---------------------------------------------------------------- estimator
 // Upward zero-crossings of the (mean-removed) heave, interpolated between
 // time-stamped samples, so skipped samples do not break the period.
+// Returns true when a wave has just finished and tp_est was refreshed.
 static float prev_t, prev_zc, zmean, last_cross_t, tp_est;
 static bool  have_prev, have_cross, armed;
-static float sum_T;                                // sum of the wave periods seen so far
-static int   n_T;                                  // number of waves averaged
 
 static void est_reset() {
   have_prev = have_cross = armed = false;
   prev_t = prev_zc = zmean = last_cross_t = 0.0f;
   tp_est = 0.0f;
-  sum_T = 0.0f;
-  n_T = 0;
 }
 
-static void est_update(float t, float z) {
+static bool est_update(float t, float z) {
+  bool new_wave = false;
+
   if (!have_prev) {
     zmean = z;
     prev_t = t;
     prev_zc = 0.0f;
     have_prev = true;
-    return;
+    return false;
   }
   float dt = t - prev_t;
-  if (dt <= 0.0f) return;                          // out-of-order or duplicate sample
+  if (dt <= 0.0f) return false;                    // out-of-order or duplicate sample
   zmean += (dt / (MEAN_TAU + dt)) * (z - zmean);
   float zc = z - zmean;
 
   if (zc < -HYS) armed = true;
   if (armed && prev_zc < 0.0f && zc >= 0.0f) {
     float tc = prev_t + (0.0f - prev_zc) / (zc - prev_zc) * dt;
-      if (have_cross) {                              // plain mean over every wave since the reset
-        sum_T += tc - last_cross_t;
-        n_T++;
-        tp_est = (sum_T / (float)n_T) * TZ_TO_TP;
+    if (have_cross) {
+      float T = tc - last_cross_t;                 // the wave that just finished
+      if (T >= T_WAVE_MIN && T <= T_WAVE_MAX) {
+        float tp_new = T * TZ_TO_TP;
+        tp_est = (tp_est > 0.0f) ? tp_est + TP_ALPHA * (tp_new - tp_est) : tp_new;
+        new_wave = true;
       }
-      last_cross_t = tc;
-      have_cross = true;
-      armed = false;
+    }
+    last_cross_t = tc;
+    have_cross = true;
+    armed = false;
   }
   prev_t = t;
   prev_zc = zc;
+  return new_wave;
 }
 
 // ---------------------------------------------------------------- controller
-// Best Bpto per Tp, from pto_table.csv (Hs = 0.04 m only). The sweep grid is coarse
-// (3,5,7,9,12,16,...), so each value is a parabola fit around the best grid point.
-// Outside 0.70-1.20 s the ends are held.
-static const float LUT_TP[] = {0.70f, 0.75f, 0.80f, 0.85f, 0.90f, 0.95f, 1.00f, 1.05f, 1.10f, 1.15f, 1.20f};
-static const float LUT_B[]  = {8.3f,  7.7f,  7.2f,  7.9f,  11.3f, 15.8f, 20.3f, 24.3f, 27.5f, 31.2f, 33.2f};
-static const int   LUT_N    = 11;
-
+// Bpto comes straight from the generated table (pto_table.h, Hs = 0.04 m).
+// It is held constant and only re-evaluated when a wave finishes.
 static float controller(float tp) {
   if (tp <= 0.0f) return B_INIT;
-  if (tp <= LUT_TP[0]) return LUT_B[0];
-  for (int i = 1; i < LUT_N; i++) {
-    if (tp <= LUT_TP[i]) {
-      float f = (tp - LUT_TP[i - 1]) / (LUT_TP[i] - LUT_TP[i - 1]);
-      return LUT_B[i - 1] + f * (LUT_B[i] - LUT_B[i - 1]);
-    }
-  }
-  return LUT_B[LUT_N - 1];
+  return pto_lookup(tp);
 }
 
 // ---------------------------------------------------------------- serial
@@ -159,13 +157,13 @@ static void handle_line(const char* s) {
   int got = sscanf(s, "%f,%f,%f", &t, &z, &p);
   if (got < 2) return;                              // ignore garbage
 
-  est_update(t, z);
-  float tp_rep = (tp_est > 0.0f) ? constrain(tp_est, TP_LO, TP_HI) : 0.0f;
-  bpto = controller(tp_rep);
+  if (est_update(t, z)) {                           // a wave just ended -> plan the next one
+    bpto = controller(tp_est);
+  }
 
-  Serial.printf("%.2f,%.3f\n", bpto, tp_rep);       // reply first, so the OLED never delays it
+  Serial.printf("%.2f,%.3f\n", bpto, tp_est);       // reply first, so the OLED never delays it
   hal_set_load(bpto);
-  hal_show(tp_rep, bpto, p);
+  hal_show(tp_est, bpto, p);
 }
 
 void setup() {
