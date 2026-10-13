@@ -164,7 +164,7 @@ static void handle_line(const char* s) {
     bpto = controller(tp_est);
   }
 
-  Serial.printf("%.2f,%.3f\n", bpto, tp_est);       // reply first, so the OLED never delays it
+  Serial.printf("%.2f,%.3f\r\n", bpto, tp_est);       // reply first, so the OLED never delays it
   hal_set_load(bpto);
   hal_show(tp_est, bpto, p);
 }

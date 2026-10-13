@@ -59,10 +59,23 @@ TP_MIN, TP_MAX = 0.5, 2.0                             # range of pto_table_wide.
 OUT_DT = 0.005                                        # communication step (plant time)
 H = 0.0005                                            # doStep size for --solver cs
 RTOL = 1e-6                                           # CVode relative tolerance
-VIS = 5.0                                             # visual exaggeration of motion
+VIS = 5.0                                             # visual exaggeration of motion (wave HEIGHT; same for every sea)
+WAVE_STRETCH = 2.0                                    # drawn wavelength = real wavelength x this (visual only; heights and timing unchanged)
 NX = 41                                               # water columns (Tp 0.5 s waves are only 0.4 m long; use 25 if CoppeliaSim lags)
 FPS = 25.0
 G, DEPTH = 9.81, 1.0
+# scene layout, metres, world frame; CoppeliaSim's own ground plane is z = 0
+# The old scene had its still waterline at z = 0. The whole WEC is lifted so that waterline sits at LIFT; the
+# plate, glass and water are sized around the waves only. The lower CAD parts may go through the plate and the ground.
+FLOOR = 0.02           # top of the thin base plate, which rests on the ground
+DEPTH = 0.40           # still water above the plate: the waterline is at FLOOR + DEPTH
+AIR = 0.40             # glass height above the waterline (clears the highest wave and the damping box)
+WAVE_CLIP = 0.15       # waves are drawn within +-this around the waterline (the drawing gain is lowered if a sea would exceed it)
+LIFT = FLOOR + DEPTH
+WATER_ALPHA = 0.55     # opacity 0..1 of the water (as before)
+GLASS_ALPHA = 0.12     # opacity 0..1 of the glass; if it looks solid, CoppeliaSim treats the value as transparency: use 0.88
+WALL = 0.01            # glass thickness
+EDGE = 0.02            # thickness of the grey frame bars on the glass edges
 B_INIT = 7.0     # fallback only; every sea now starts at its own pto_table_wide.csv value (see pto_start)
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PTO = None
@@ -344,6 +357,38 @@ client = RemoteAPIClient()
 sim = client.require("sim")
 sim.setStepping(False)                        # free-running, we only draw
 
+# Startup cleanup: remove everything an earlier run (or an earlier scene design) left in the scene, so the new
+# scene is not overlaid on the old one. Every shape is removed except CoppeliaSim's floor, INCLUDING everything
+# below the floor object in the scene tree (the visible floor is usually a child shape of a "ResizableFloor..."
+# object, and deleting that child makes the floor invisible). Cameras, lights, dummies are left alone.
+# Any object whose name contains one of KEEP_NAME_PARTS (case-insensitive), and its whole subtree, is protected.
+KEEP_NAME_PARTS = ("floor",)
+
+
+def clean_scene():
+    try:                                      # a simulation left running by a previous (crashed) run
+        if sim.getSimulationState() != sim.simulation_stopped:
+            sim.stopSimulation()
+            while sim.getSimulationState() != sim.simulation_stopped:
+                time.sleep(0.05)
+    except Exception as e:
+        print("cleanup: could not check/stop the simulation:", e)
+    keep = set()
+    for h in sim.getObjectsInTree(sim.handle_scene, sim.handle_all, 0):
+        try:
+            alias = sim.getObjectAlias(h).lower()
+        except Exception:
+            alias = ""
+        if any(p in alias for p in KEEP_NAME_PARTS):
+            keep.update(sim.getObjectsInTree(h, sim.handle_all, 0))      # the object and all its descendants
+    doomed = [h for h in sim.getObjectsInTree(sim.handle_scene, sim.object_shape_type, 0) if h not in keep]
+    if doomed:
+        sim.removeObjects(doomed)
+    print(f"cleanup: removed {len(doomed)} old shape(s) from the scene")
+
+
+clean_scene()
+
 
 def setpos(h, p):
     try:
@@ -358,7 +403,16 @@ def colour(h, rgb):
 
 def prep(h, rgb):
     sim.setObjectInt32Param(h, sim.shapeintparam_static, 1)
+    try:                                       # no collisions: waves and glass pass through the WEC
+        sim.setObjectInt32Param(h, sim.shapeintparam_respondable, 0)
+        sim.setObjectSpecialProperty(h, sim.getObjectSpecialProperty(h) & ~sim.objectspecialproperty_collidable)
+    except Exception:
+        pass
     colour(h, rgb)
+
+
+def translucent(h, alpha):
+    sim.setShapeColor(h, None, sim.colorcomponent_transparency, [alpha])
 
 
 def shape(size, pos, rgb):
@@ -375,24 +429,175 @@ def part(name, rgb):
     h = sim.importShape(4, os.path.join(CAD, f"{name}_local.stl"), 0, 0.0001, 1.0)
     prep(h, rgb)
     p = pose[name]
-    setpos(h, [p["x"], p["y"], p["z"]])
+    setpos(h, [p["x"], p["y"], p["z"] + LIFT])
     return h, p
 
 
 buoy, bp = part("buoy", [0.95, 0.95, 0.95])
 part("shaft", [0.35, 0.35, 0.4])
 part("base", [0.3, 0.3, 0.3])
-shape([2.4, 0.8, 0.02], [0, 0, -1.0], [0.76, 0.68, 0.45])                 # seabed
-pto = shape([0.08, 0.08, 0.06], [0, 0, 0.23], [0.0, 1.0, 0.0])            # colour = damping
 
 xs = np.linspace(-1.0, 1.0, NX)
 dx = xs[1] - xs[0]
-water = [(x, shape([dx, 0.6, 0.5], [x, 0, -0.25], [0.15, 0.5, 0.9])) for x in xs if abs(x) > 0.14]
-for _, h in water:
-    sim.setShapeColor(h, None, sim.colorcomponent_transparency, [0.55])
+HX = xs[-1] + dx / 2                                  # inner half length of the container: the columns tile it exactly
+HY = 0.30                                             # inner half width
+TOP = LIFT + AIR                                      # top of the open glass container
+print(f"scene: base plate on the ground, waterline z={LIFT:.2f} m, glass top z={TOP:.2f} m")
 
-seg = [shape([0.06, 0.06, 0.04], [0, -0.55, i * 0.055], [0.2, 0.2, 0.2]) for i in range(8)]
+# thin base plate on the ground, then the open-topped glass container on it
+shape([2 * HX + 0.3, 2 * HY + 0.3, FLOOR], [0, 0, FLOOR / 2], [0.55, 0.55, 0.58])
+H_GLASS = TOP - FLOOR
+GZ = FLOOR + H_GLASS / 2
+walls = [shape([2 * HX + 2 * WALL, WALL, H_GLASS], [0, -(HY + WALL / 2), GZ], [0.75, 0.9, 1.0]),
+         shape([2 * HX + 2 * WALL, WALL, H_GLASS], [0, HY + WALL / 2, GZ], [0.75, 0.9, 1.0]),
+         shape([WALL, 2 * HY, H_GLASS], [-(HX + WALL / 2), 0, GZ], [0.75, 0.9, 1.0]),
+         shape([WALL, 2 * HY, H_GLASS], [HX + WALL / 2, 0, GZ], [0.75, 0.9, 1.0])]
+for h in walls:
+    translucent(h, GLASS_ALPHA)
+
+# grey frame on all 12 edges of the glass cuboid (the top edges form the rim; the top itself stays open)
+GREY = [0.45, 0.45, 0.48]
+X0, Y0 = HX + WALL, HY + WALL                         # outer half extents of the glass
+for sx in (-1, 1):
+    for sy in (-1, 1):
+        shape([EDGE, EDGE, H_GLASS], [sx * X0, sy * Y0, GZ], GREY)                                # vertical corner posts
+    for z in (TOP, FLOOR + EDGE / 2):                                                              # top rim, bottom rim
+        shape([2 * X0 + EDGE, EDGE, EDGE], [0, sx * Y0, z], GREY)                                 # along x (front, back)
+        shape([EDGE, 2 * Y0 - EDGE, EDGE], [sx * X0, 0, z], GREY)                                 # along y (left, right)
+
+# Water = ONE closed, wavy-topped block (top follows the wave, bottom sits on the base plate), rebuilt each frame.
+# Backface culling is on and every face points outward, so only the outer faces are drawn: the underside and the
+# faces on the far side are never visible, and there are no stacked translucent boxes to show darker bands.
+# Where a wave would dip under the base plate the top is clamped to the plate top.
+WATER_RGB = [0.15, 0.5, 0.9]
+EX = np.concatenate(([-HX], xs, [HX]))                # block edge to edge across the container
+NE = len(EX)
+IDX = []
+for i in range(NE - 1):
+    j = i + 1
+    TFi, TBi, BFi, BBi = 4 * i, 4 * i + 1, 4 * i + 2, 4 * i + 3          # top/bottom, front(-y)/back(+y)
+    TFj, TBj, BFj, BBj = 4 * j, 4 * j + 1, 4 * j + 2, 4 * j + 3
+    IDX += [TFi, TFj, TBj, TFi, TBj, TBi]             # top    (+z)
+    IDX += [BFi, BFj, TFj, BFi, TFj, TFi]             # front  (-y)
+    IDX += [BBi, TBj, BBj, BBi, TBi, TBj]             # back   (+y)
+    IDX += [BFi, BBj, BFj, BFi, BBi, BBj]             # bottom (-z)
+L = NE - 1
+IDX += [2, 1, 3, 2, 0, 1]                             # left end  (-x)
+IDX += [4 * L + 2, 4 * L + 3, 4 * L + 1, 4 * L + 2, 4 * L + 1, 4 * L]   # right end (+x)
+water_h = None
+flip = False
+
+
+def build_verts(z_arr, e=0.0):
+    verts = []
+    for i, (x, z) in enumerate(zip(EX, z_arr)):
+        x, z = float(x), float(z)
+        x += e if i == 0 else (-e if i == NE - 1 else 0.0)
+        verts += [x, -HY + e, z, x, HY - e, z, x, -HY + e, FLOOR + e, x, HY - e, FLOOR + e]
+    return verts
+
+
+# Flicker fix, main path: the whole "remove old block, build new block, colour it, make it translucent" sequence runs
+# INSIDE CoppeliaSim as one call (Lua in the sandbox script), so the renderer can never draw a half-built block (the
+# opaque white/grey one) or two blocks at once. Done from Python it is 5-6 separate remote calls with renders in between.
+LUA_DEF = """
+wecIdx = {%s}
+wecWater = nil
+function wecSurface(verts)
+  local mk = sim.createShape or sim.createMeshShape
+  local sh = mk(17, 0, verts, wecIdx)
+  sim.setShapeColor(sh, nil, sim.colorcomponent_ambient_diffuse, {%f, %f, %f})
+  sim.setShapeColor(sh, nil, sim.colorcomponent_transparency, {%f})
+  if wecWater then
+    if sim.removeObjects then sim.removeObjects({wecWater}) else sim.removeObject(wecWater) end
+  end
+  wecWater = sh
+  return sh
+end
+""" % (",".join(str(i) for i in IDX), WATER_RGB[0], WATER_RGB[1], WATER_RGB[2], WATER_ALPHA)
+sandbox = None
+
+
+def _shapes():
+    return set(sim.getObjectsInTree(sim.handle_scene, sim.object_shape_type, 0))
+
+
+def init_atomic():
+    """Install the Lua helper as a scene script and test it once; leave sandbox = None (Python fallback) on failure.
+    (sim.executeScriptString is not in the remote API of every CoppeliaSim version, so the helper is added as a
+    script and called with sim.callScriptFunction instead.)"""
+    global sandbox
+    before = _shapes()
+    try:
+        h = sim.addScript(sim.scripttype_customizationscript)
+        sim.setScriptStringParam(h, sim.scriptstringparam_text, LUA_DEF)
+        sim.initScript(h)
+        sandbox = h
+        surface(np.full(NE, LIFT))                              # test call: must add exactly one shape
+        added = _shapes() - before
+        if len(added) != 1:
+            raise RuntimeError(f"test call added {len(added)} shapes")
+        print("water: atomic in-simulator update enabled")
+    except Exception as ex:
+        print(f"water: atomic update unavailable ({type(ex).__name__}: {ex}); using the plain Python update (may flicker)")
+        try:
+            if sandbox is not None:
+                sim.removeScript(sandbox)
+            elif 'h' in dir():
+                sim.removeScript(h)
+        except Exception:
+            pass
+        sandbox = None
+        extra = _shapes() - before
+        if extra:
+            sim.removeObjects(list(extra))
+
+
+def surface(z_arr):
+    """Replace the water block with one built from the surface heights at EX."""
+    global water_h, flip
+    if sandbox is not None:
+        sim.callScriptFunction("wecSurface", sandbox, build_verts(z_arr))
+        return
+    flip = not flip                      # fallback path: alternate 0.7 mm smaller so overlapping blocks do not z-fight
+    new = sim.createShape(1 | 16, 0, build_verts(z_arr, 0.0007 if flip else 0.0), IDX)
+    sim.setObjectInt32Param(new, sim.objintparam_visibility_layer, 0)     # hidden while being styled
+    colour(new, WATER_RGB)
+    translucent(new, WATER_ALPHA)
+    sim.setObjectInt32Param(new, sim.objintparam_visibility_layer, 1)
+    if water_h is not None:
+        sim.removeObjects([water_h])
+    water_h = new
+
+
+init_atomic()
+
+pto = shape([0.08, 0.08, 0.06], [0, 0, 0.23 + LIFT], [0.0, 1.0, 0.0])     # colour = damping
+
+# damping indicator: the same 8 segments as before, half size, horizontal, on the front rim at the left corner
+MS = 0.5
+seg = [shape([0.04 * MS, 0.06 * MS, 0.06 * MS],
+             [-HX + 0.03 + i * 0.055 * MS, -Y0, TOP + EDGE / 2 + 0.03 * MS], [0.2, 0.2, 0.2]) for i in range(8)]
 lit = -1
+
+gain_state = {"wave": None, "g": VIS}
+
+
+def display_gain(wave):
+    """VIS, or less if the largest wave of this sea (anywhere in the tank, first 60 s) would not fit in +-WAVE_CLIP.
+    Buoy and waves share the gain, so the buoy still rides on the surface."""
+    if gain_state["wave"] is not wave:
+        w, a_i, ph, kw = wave
+        kw = kw / WAVE_STRETCH
+        tt = np.arange(0.0, 60.0, 0.05)
+        arg = ph[:, None] - kw[:, None] * xs[None, :]                         # (components, columns)
+        E = (np.cos(w[None, :] * tt[:, None]) * a_i[None, :]) @ np.cos(arg) \
+            - (np.sin(w[None, :] * tt[:, None]) * a_i[None, :]) @ np.sin(arg)   # eta(t, x)
+        peak = float(np.abs(E).max())
+        g = min(VIS, 0.98 * WAVE_CLIP / max(peak, 1e-9))
+        gain_state.update(wave=wave, g=g)
+        print(f"    display: waves and buoy drawn x{g:.1f} (largest wave in the tank {peak * 1000:.0f} mm)")
+    return gain_state["g"]
 
 
 def dcol(b):                                  # green (low) to red (high)
@@ -411,12 +616,14 @@ def meter(b):
 
 def draw(wave, t, z, b):
     w, a_i, ph, kw = wave
-    setpos(buoy, [bp["x"], bp["y"], bp["z"] + VIS * z])
+    g = display_gain(wave)
+    setpos(buoy, [bp["x"], bp["y"], bp["z"] + LIFT + g * z])
     colour(pto, dcol(b))
     meter(b)
-    for x, h in water:
-        eta = float(np.sum(a_i * np.cos(w * t - kw * x + ph)))
-        setpos(h, [x, 0, VIS * eta - 0.25])
+    kw = kw / WAVE_STRETCH
+    eta = np.cos(w[None, :] * t - kw[None, :] * EX[:, None] + ph[None, :]) @ a_i      # eta at every sheet vertex
+    d = np.clip(g * eta, -WAVE_CLIP, WAVE_CLIP)
+    surface(np.maximum(LIFT + d, FLOOR + 0.002))
 
 
 # ---------------------------------------------------------------- run
@@ -499,3 +706,8 @@ try:
 finally:
     stop.set()
     sim.stopSimulation()
+    if sandbox is not None:
+        try:
+            sim.removeScript(sandbox)             # the helper script added by init_atomic
+        except Exception:
+            pass
